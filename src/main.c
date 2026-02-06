@@ -1,6 +1,7 @@
 #include "sam3xa.h"
-
 #include "sin_lut_1024.h"
+#include "init.h"
+#include "uart.h"
 
 // Конфигурация под сигнальный PB27 - для вывода на светодиод
 // событий, в том числе и за счет различной последовательности
@@ -46,49 +47,11 @@ static inline void dds_set_freq_hz(uint32_t f_hz) {
   phase_inc = (uint32_t)(((uint64_t)f_hz << 32) / f_update);
 }
 
-
-// Инициализация PB27
-static inline void gpio_init_out(void) {
-  TEST_PIO->PIO_PER  = TEST_MASK;    // Включение управления выводом TEST_PIN
-  TEST_PIO->PIO_OER  = TEST_MASK;    // Установка TEST_PIN как выход
-  TEST_PIO->PIO_CODR = TEST_MASK;    // Установка уровня LOW на TEST_PIN
-}
-
-
-static inline void sync_in_init(void) {
-  PMC->PMC_WPMR  = 0x504D4300;
-  PMC->PMC_PCER0 = (1u << ID_PIOB);
-
-  // PB26 input
-  PIOB->PIO_PER  = SYNC_IN_MASK;
-  PIOB->PIO_ODR  = SYNC_IN_MASK;
-  PIOB->PIO_PUER = SYNC_IN_MASK;   // подтяжка
-
-  // Rising edge interrupt
-  PIOB->PIO_AIMER  = SYNC_IN_MASK;
-  PIOB->PIO_ESR    = SYNC_IN_MASK; // edge
-  PIOB->PIO_REHLSR = SYNC_IN_MASK; // rising
-
-  (void)PIOB->PIO_ISR;             // clear pending
-  PIOB->PIO_IER = SYNC_IN_MASK;
-
-  NVIC_ClearPendingIRQ(PIOB_IRQn);
-  NVIC_SetPriority(PIOB_IRQn, 1);
-  NVIC_EnableIRQ(PIOB_IRQn);
-
-  // debug snapshots
-  //dbg_pio_imr  = PIOB->PIO_IMR;
-  //dbg_pio_pdsr = PIOB->PIO_PDSR;
-}
-
-
 void PIOB_Handler(void) __attribute__((used));
 void PIOB_Handler(void) {
   PIOB->PIO_ISR;   // ACK! обязательно
   g_sync_seen = 1;
 }
-
-
 
 //Переключение PB27
 static inline void toggle_pin(void) {
@@ -118,56 +81,23 @@ void TC0_Handler(void) {
   }
 }
 
-static inline void dacc_init(void) {
-  // Включить тактирование DACC (ID_DACC в PMC_PCER1, т.к. >31)
-  PMC->PMC_PCER1 = (1u << (ID_DACC - 32));
-
-  // (Опционально) снять защиту записи DACC, если включена
-  // В SAM3X у DACC есть WPMR. Для начала можно просто отключить WP:
-  DACC->DACC_WPMR = 0x44414300; // "DAC", WPEN=0
-
-  // Сброс
-  DACC->DACC_CR = DACC_CR_SWRST;
-
-  // Режим:
-  // - TRGEN_DIS: обновляем вручную
-  // - WORD_HALF: 12-bit
-  // - TAG_EN: удобно писать в один регистр и выбирать канал
-  DACC->DACC_MR =
-      DACC_MR_TRGEN_DIS |
-      DACC_MR_WORD_HALF |
-      DACC_MR_TAG_EN |
-      DACC_MR_STARTUP_8;
-
-  // Разрешить каналы
-  DACC->DACC_CHER = DACC_CHER_CH0 | DACC_CHER_CH1;
-}
-
-static inline void dacc_init_slave(void) {
-  // Включить тактирование DACC (ID_DACC > 31 => PCER1)
-  PMC->PMC_PCER1 = (1u << (ID_DACC - 32u));
-
-  // Отключить write protect DACC
-  DACC->DACC_WPMR = 0x44414300;  // "DAC", WPEN=0
-
-  // Reset
-  DACC->DACC_CR = DACC_CR_SWRST;
-
-  // Manual write, half-word, TAG enabled
-  DACC->DACC_MR =
-      DACC_MR_TRGEN_DIS |
-      DACC_MR_WORD_HALF |
-      DACC_MR_TAG_EN |
-      DACC_MR_STARTUP_8;
-
-  // Enable channel 0 only
-  DACC->DACC_CHER = DACC_CHER_CH0;
-}
-
-
 static inline void dacc_write_ch(uint8_t ch, uint16_t v12) {
   while ((DACC->DACC_ISR & DACC_ISR_TXRDY) == 0) { }
   DACC->DACC_CDR = ((uint32_t)ch << 12) | (v12 & 0x0FFF);
+}
+
+static volatile uint32_t g_ms_ticks = 0u;
+
+void SysTick_Handler(void) __attribute__((used));
+void SysTick_Handler(void) {
+  g_ms_ticks++;
+}
+
+static inline void delay_ms(uint32_t ms) {
+  uint32_t start = g_ms_ticks;
+  while ((uint32_t)(g_ms_ticks - start) < ms) {
+    __NOP();
+  }
 }
 
 
@@ -175,9 +105,15 @@ static inline void dacc_write_ch(uint8_t ch, uint16_t v12) {
 int main(void) {
   // 1) снять защиту PMC и включить тактирование
   PMC->PMC_WPMR = 0x504D4300;                  // WPKEY="PMC", WPEN=0
-  PMC->PMC_PCER0 = (1u << ID_PIOB) | (1u << ID_TC0);
+  PMC->PMC_PCER0 =  (1u << ID_PIOB) |   // Включение тактирования для PIOB
+                    (1u << ID_TC0) |    // Включение тактирования для TC0
+                    (1u << ID_USART0) | // Включение тактирования для USART0
+                    (1u << ID_USART1);  // Включение тактирования для USART1
 
   SystemCoreClockUpdate();
+  SysTick_Config(SystemCoreClock / 1000u);
+
+  uart_init();
 
   sync_in_init();
 
@@ -226,5 +162,11 @@ int main(void) {
   while (1) {
     //cv_test = TC0->TC_CHANNEL[0].TC_CV;
     //__WFI();
+    //uart0_send_text("UART0 TEST\r\n");
+    //delay_ms(500);
+
+    if (uart0_poll_com_n_gen()) {
+      dds_set_freq_hz(g_params_in.com_n_gen);
+    }
   }
 }
